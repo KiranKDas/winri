@@ -27,6 +27,7 @@ mod system;
 mod utils;
 mod winapi;
 mod window;
+pub mod ipc;
 
 pub const DEBUG_MODE: bool = cfg!(debug_assertions);
 /// The crate version, baked in at compile time. Surfaced in bug report URLs.
@@ -44,6 +45,14 @@ pub fn root_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "msg" {
+        if let Err(e) = ipc::run_client(&args[2..]) {
+            eprintln!("Error connecting to winri: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         log::error!("Winri panicked: {info}");

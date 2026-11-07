@@ -28,6 +28,9 @@ const IGNORED_PROCESS_NAMES: &[&str] = &[
     "SnippingTool.exe",
     "PowerToys.PowerLauncher.exe",
     "Ditto.exe",
+    "AQAUserPS.exe",
+    "winri.exe",
+    "winri-dev.exe",
 ];
 
 macro_rules! filter_out_if {
@@ -41,26 +44,78 @@ macro_rules! filter_out_if {
 /// Whether a single window qualifies for tiling, applying every exclusion rule
 /// (visibility, cloaking, dialogs, ignored classes/processes, …).
 pub fn should_be_tiled(window: Window) -> anyhow::Result<bool> {
-    filter_out_if!(!window.is_visible()?);
-    filter_out_if!(window.is_cloaked()?);
-    filter_out_if!(!window.is_ancestor()?);
-    filter_out_if!(window.is_dialog()?);
-    let title = window.title()?;
+    should_be_tiled_with_rules(window, &[])
+}
+
+/// Whether a single window qualifies for tiling, applying exclusion rules
+/// and custom user window rules (`open_floating`, `block_out`).
+pub fn should_be_tiled_with_rules(
+    window: Window,
+    rules: &[crate::config::WindowRule],
+) -> anyhow::Result<bool> {
+    // 1. Never tile Winri's own windows
+    if let Ok(pid) = window.process_id() {
+        if pid == std::process::id() {
+            return Ok(false);
+        }
+    }
+
+    filter_out_if!(!window.is_visible().unwrap_or(false));
+    filter_out_if!(window.is_cloaked().unwrap_or(false));
+    filter_out_if!(!window.is_ancestor().unwrap_or(true));
+    filter_out_if!(window.is_dialog().unwrap_or(false));
+    filter_out_if!(window.is_tool_window().unwrap_or(false));
+
+    let class = window.class().unwrap_or_default();
+    filter_out_if!(class == "#32770");
+    filter_out_if!(IGNORED_CLASSES.contains(&class.as_str()));
+    // Ignore JUCE-based audio overlays / OSDs (e.g. AQAUserPS.exe)
+    if class.starts_with("JUCE_") {
+        return Ok(false);
+    }
+
+    let title = window.title().unwrap_or(None);
     filter_out_if!(title.is_none());
-    filter_out_if!(title.is_some_and(|title| title.contains(WINRI_IGNORED_WINDOW_TITLE_SUBSTRING)));
-    filter_out_if!(IGNORED_CLASSES.contains(&window.class()?.as_str()));
-    filter_out_if!(IGNORED_PROCESS_NAMES.contains(&window.process_name()?.as_str()));
-    filter_out_if!(!window.is_valid()?);
+    filter_out_if!(title.as_ref().is_some_and(|title| {
+        title.contains(WINRI_IGNORED_WINDOW_TITLE_SUBSTRING)
+            || title == "QA OSD"
+            || title.ends_with(" OSD")
+    }));
+
+    let proc_name = window.process_name().unwrap_or_default();
+    if !proc_name.is_empty() {
+        filter_out_if!(IGNORED_PROCESS_NAMES
+            .iter()
+            .any(|&p| p.eq_ignore_ascii_case(&proc_name)));
+    }
+    filter_out_if!(!window.is_valid().unwrap_or(false));
+
+    let title_str = title.as_deref().unwrap_or("");
+    for rule in rules {
+        if rule.matches.is_match(&proc_name, title_str, &class) {
+            if rule.block_out.unwrap_or(false) || rule.open_floating.unwrap_or(false) {
+                return Ok(false);
+            }
+        }
+    }
 
     Ok(true)
 }
 
 /// The current set of tileable windows: every top-level window passed through
 /// [`should_be_tiled`]. This is the snapshot fed to the tiler.
+#[allow(dead_code)]
 pub fn opened_windows() -> anyhow::Result<HashSet<Window>> {
+    opened_windows_with_rules(&[])
+}
+
+/// The current set of tileable windows respecting user window rules.
+pub fn opened_windows_with_rules(
+    rules: &[crate::config::WindowRule],
+) -> anyhow::Result<HashSet<Window>> {
     let windows = Window::enumerate()?
         .into_iter()
-        .filter(|window| should_be_tiled(*window).unwrap_or(false))
+        .filter(|window| should_be_tiled_with_rules(*window, rules).unwrap_or(false))
         .collect::<HashSet<_>>();
 
     Ok(windows)

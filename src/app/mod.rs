@@ -2,9 +2,9 @@
 //! iced daemon. The flow is `subscription` (global keyboard + window hooks)
 //! -> [`Message`] -> [`State::handle_app_message`] -> [`Task`]s, with the
 //! current [`Mode`] deciding how input is interpreted and what is rendered.
-mod action;
+pub mod action;
 mod service;
-mod subscription;
+pub mod subscription;
 pub mod task;
 mod view;
 
@@ -32,7 +32,6 @@ use crate::{
     scroll_tiler::ScrollTiler,
     system::{self, message_box_query},
     utils::math::Size,
-    window::{self},
 };
 
 /// The whole application state. A single instance lives for the program's
@@ -95,7 +94,15 @@ fn create_overlay_window(screen_size: Size) -> (iced::window::Id, Task<Message>)
         ..Default::default()
     });
 
-    (id, task.then(iced::window::enable_mouse_passthrough))
+    (
+        id,
+        task.then(move |id| {
+            Task::batch([
+                iced::window::enable_mouse_passthrough(id),
+                task::ensure_overlay_not_focused(id),
+            ])
+        }),
+    )
 }
 
 impl State {
@@ -126,9 +133,11 @@ Do you want to continue with default values ?
 
         let screen_size = system::screen_size().expect("Screen size retrieval");
         let work_area = system::work_area().expect("Work area retrieval");
-        let tiler = ScrollTiler::new(config.clone(), work_area);
+        let tiler = ScrollTiler::new(config.clone(), work_area, screen_size);
         let (overlay_window_id, overlay_window_creation_task) = create_overlay_window(screen_size);
         init_tasks.push(overlay_window_creation_task);
+
+        system::ensure_taskbar_on_top();
 
         (
             Self {
@@ -142,10 +151,9 @@ Do you want to continue with default values ?
         )
     }
 
-    /// Title for every winri-owned window. Deliberately the "ignore" marker so
-    /// winri never tries to tile its own windows (see [`window::filter`]).
+    /// Title for winri's overlay window. Kept empty so no caption bar text appears.
     pub fn title(_: &Self, _window_id: iced::window::Id) -> String {
-        window::filter::WINRI_IGNORED_WINDOW_TITLE_SUBSTRING.into()
+        String::new()
     }
 
     /// Central message dispatch (the daemon's `update` callback): routes each
@@ -197,7 +205,11 @@ Do you want to continue with default values ?
                     return Task::done(Message::Action(action));
                 }
             }
+            GlobalMessage::IpcAction(action) => {
+                return Task::done(Message::Action(action));
+            }
             GlobalMessage::Window => {
+                system::ensure_taskbar_on_top();
                 self.update_tiler()
                     .context("global window event")
                     .handle_faillible_process()
@@ -206,6 +218,48 @@ Do you want to continue with default values ?
             GlobalMessage::ConfigChanged(path) => {
                 let config = config::load_from(path).unwrap_or_default();
                 self.config.store(Arc::new(config));
+            }
+            GlobalMessage::Tick => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    let _ = self.tiler.tick_animation();
+                    let _ = self.update_tiler_border();
+                    system::ensure_taskbar_on_top();
+                }
+            }
+            GlobalMessage::MouseScroll { delta_x, delta_y, modifiers } => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    if modifiers.contains(keyboard_types::Modifiers::SHIFT) {
+                        if delta_y > 0.0 || delta_x < 0.0 {
+                            self.tiler.swap_current_left();
+                        } else {
+                            self.tiler.swap_current_right();
+                        }
+                    } else if delta_y > 0.0 || delta_x < 0.0 {
+                        self.tiler.focus_left();
+                    } else {
+                        self.tiler.focus_right();
+                    }
+                    let _ = self.update_tiler();
+                }
+            }
+            GlobalMessage::MouseDragStart { button, x, y } => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    self.tiler.handle_mouse_drag_start(button, x, y);
+                    let _ = self.update_tiler_border();
+                }
+            }
+            GlobalMessage::MouseDragUpdate { x, y } => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    self.tiler.handle_mouse_drag_update(x, y);
+                    self.tiler.apply_layout();
+                    let _ = self.update_tiler_border();
+                }
+            }
+            GlobalMessage::MouseDragEnd => {
+                if matches!(self.mode, Mode::Tiler(_)) {
+                    self.tiler.handle_mouse_drag_end();
+                    let _ = self.update_tiler_border();
+                }
             }
         }
         Task::none()

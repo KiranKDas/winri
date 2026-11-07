@@ -1,0 +1,98 @@
+# Winri Configuration (niri-style window tiler for Windows 11)
+
+layout:
+  # Camera tracking mode when focusing columns:
+  # - always: The focused column is strictly centered horizontally in the screen
+  # - on-overflow: The screen only scrolls when focus moves off-screen (revealing just enough)
+  # - never: Viewport does not automatically scroll on focus changes
+  center_focused_column: "always"
+
+default_window:
+  # Padding between the screen and apps (px)
+  screen_padding: 10.0
+  # Alternatively, per-side screen margins:
+  # screen_padding:
+  #   top: 10.0
+  #   bottom: 10.0
+  #   left: 10.0
+  #   right: 10.0
+
+  # Padding between apps (px)
+  app_gap: 10.0
+
+  # Border settings for active window highlight
+  border_thickness: 4.0
+  border_radius: 4.0
+
+  # Incremental resize amount in px
+  resize_increment: 20.0
+
+  # Inactive window translucency (optional, false by default)
+  translucency:
+    enabled: false
+    inactive_opacity: 0.88
+
+animations:
+  # Smooth ribbon scrolling animations (subtle ease-out translation, zero springiness)
+  enabled: true
+  # Optional slowdown factor (default 1.0; increase for slower glide, e.g. 1.5)
+  # slowdown: 1.0
+
+# Window Matching Rules:
+# Criteria: app_id (process name), title, class_name
+# Properties: default_column_width, open_floating, open_maximized_to_column, open_fullscreen, block_out, min_width, max_width
+window_rules:
+  # Example: Make Windows Calculator open as floating (unmanaged)
+  - matches:
+      app_id: "CalculatorApp.exe"
+    open_floating: true
+
+  # Example: Open Notepad at half the screen width
+  - matches:
+      app_id: "notepad.exe"
+    default_column_width:
+      proportion: 0.5
+
+keybindings:
+  # Column navigation (horizontal ribbon)
+  focus_left: "Meta+Left"
+  focus_right: "Meta+Right"
+
+  # In-column navigation (vertical window stack)
+  focus_up: "Meta+Up"
+  focus_down: "Meta+Down"
+
+  # Two-Axis Workspace Navigation (Vertical Axis)
+  focus_workspace_up: "Meta+PageUp"
+  focus_workspace_down: "Meta+PageDown"
+  move_to_workspace_up: "Meta+Shift+PageUp"
+  move_to_workspace_down: "Meta+Shift+PageDown"
+
+  # Stacking operations
+  move_into_col_above: "Meta+Shift+Up"
+  move_into_col_below: "Meta+Shift+Down"
+  consume_window: "Meta+Ctrl+Down"
+  expel_window: "Meta+Ctrl+Up"
+
+  # Reorder columns along the ribbon
+  swap_col_left: "Meta+Ctrl+Left"
+  swap_col_right: "Meta+Ctrl+Right"
+
+  # Width & stack sizing
+  cycle_width: "Meta+C"
+  maximize_column: "Meta+M"
+  reset_window_height: "Meta+Shift+H"
+  resize_fullscreen: "Meta+F"
+  resize_halfscreen: "Meta+H"
+  increment_width: "Meta+Alt+Right"
+  decrement_width: "Meta+Alt+Left"
+
+  # Window lifecycle
+  close_current: "Meta+Q"
+
+  # Overview thumbnails & refresh
+  open_overview: "Meta+O"
+  force_refresh: "Meta+R"
+
+  # Exit Winri
+  exit: "Meta+Escape"

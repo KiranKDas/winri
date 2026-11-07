@@ -19,10 +19,20 @@ use crate::{
     window::Window,
 };
 
+/// An item represented in overview mode, with an assigned number (1..=9).
+#[derive(Debug, Clone)]
+pub struct OverviewItem {
+    pub window: Window,
+    pub number: usize,
+    pub pos: crate::utils::math::Position,
+    pub size: crate::utils::math::Size,
+}
+
 /// State specific to overview mode: the preview windows currently open, paired
 /// with their DWM thumbnail registration so both can be torn down on close.
 pub struct State {
-    opened_thumbnails: Vec<(ThumbnailId, iced::window::Id)>,
+    pub opened_thumbnails: Vec<(ThumbnailId, iced::window::Id)>,
+    pub items: Vec<OverviewItem>,
 }
 
 /// Payload reported once the iced runtime has finished creating a preview
@@ -49,7 +59,7 @@ impl app::State {
     /// window. Each window's creation resolves into a
     /// [`Message::ThumbnailWindowCreated`], which [`Self::finalize_open_overview`]
     /// then turns into a live thumbnail. No-op if already in overview mode.
-    pub fn prepare_open_overview(&self) -> Task<app::Message> {
+    pub fn prepare_open_overview(&mut self) -> Task<app::Message> {
         if matches!(self.mode, Mode::Overview(_)) {
             log::warn!(
                 "Overview operation requested in {} while already in Overview mode",
@@ -58,12 +68,19 @@ impl app::State {
             return Task::none();
         }
 
-        let windows = self.tiler.windows();
-
-        let windows_data = windows
-            .map(|item| thumbnail::WindowData {
-                inner: item.inner,
-                width: item.width,
+        // Collect flat window list from the column/ribbon model.
+        // Each column contributes a `WindowData` per window-item; we use the
+        // column's width for the thumbnail scale calculation.
+        let windows_data: Vec<thumbnail::WindowData> = self
+            .tiler
+            .active_ribbon()
+            .columns
+            .iter()
+            .flat_map(|col| {
+                col.windows.iter().map(move |item| thumbnail::WindowData {
+                    inner: item.inner,
+                    width: col.width as f32,
+                })
             })
             .collect_vec();
 
@@ -72,6 +89,23 @@ impl app::State {
             self.tiler.work_area().size(),
             10.0,
         );
+
+        let items: Vec<OverviewItem> = windows_data
+            .iter()
+            .zip(&thumbnails_data)
+            .enumerate()
+            .map(|(idx, (w, thumb))| OverviewItem {
+                window: w.inner,
+                number: idx + 1,
+                pos: thumb.pos,
+                size: thumb.size,
+            })
+            .collect();
+
+        self.mode = Mode::Overview(State {
+            opened_thumbnails: Vec::new(),
+            items,
+        });
 
         Task::batch(thumbnails_data.into_iter().zip(windows_data).map(
             |(thumbnail_data, window)| {
@@ -108,23 +142,17 @@ impl app::State {
             size,
         }: ThumbnailWindowCreated,
     ) -> anyhow::Result<()> {
-        // Switch to overview mode if not already in it
-        if !matches!(self.mode, Mode::Overview(_)) {
-            log::info!("switching to Overview mode");
-            self.mode = Mode::Overview(State {
-                opened_thumbnails: Vec::new(),
-            });
-        }
-
         let Mode::Overview(State {
             opened_thumbnails: thumbnails,
+            ..
         }) = &mut self.mode
         else {
-            unreachable!("checked above that we are in Overview mode")
+            return Ok(());
         };
 
-        for tiled_window in self.tiler.windows() {
-            tiled_window.inner.move_offscreen()?;
+        // Move all tiled windows offscreen while previews stand in for them.
+        for item in self.tiler.windows() {
+            item.inner.move_offscreen()?;
         }
 
         let dest_window = Window::from_safe_hwnd(dest_raw_handle)
@@ -150,6 +178,7 @@ impl app::State {
     pub fn close_overview(&mut self) -> anyhow::Result<Task<app::Message>> {
         let Mode::Overview(State {
             opened_thumbnails: thumbnails,
+            ..
         }) = &self.mode
         else {
             log::warn!(
@@ -168,6 +197,40 @@ impl app::State {
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         self.switch_to_tiler_mode()?;
+
+        Ok(Task::batch(tasks))
+    }
+
+    /// Tears down overview, focuses the window assigned to `number`, and returns to tiler mode.
+    pub fn close_overview_and_focus(&mut self, number: usize) -> anyhow::Result<Task<app::Message>> {
+        let Mode::Overview(State {
+            opened_thumbnails: thumbnails,
+            items,
+        }) = &self.mode
+        else {
+            log::warn!(
+                "Close overview and focus requested in {} while not in Overview mode",
+                crate::function!()
+            );
+            return Ok(Task::none());
+        };
+
+        let target_window = items.iter().find(|it| it.number == number).map(|it| it.window);
+
+        let tasks = thumbnails
+            .iter()
+            .map(|(thumbnail_id, window_id)| {
+                thumbnail::unbind_thumbnail(*thumbnail_id).map(|()| window_id)
+            })
+            .map(|window_id| window_id.map(|id| iced::window::close(*id)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        self.switch_to_tiler_mode()?;
+
+        if let Some(target) = target_window {
+            self.tiler.focus_window_by_handle(target);
+            self.update_tiler()?;
+        }
 
         Ok(Task::batch(tasks))
     }

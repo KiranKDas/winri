@@ -5,7 +5,10 @@
 
 use std::{
     ptr::null_mut,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::Ordering,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -14,14 +17,18 @@ use iced::futures::channel::mpsc::Sender;
 use windows::Win32::UI::{
     Accessibility::{SetWinEventHook, UnhookWinEvent},
     WindowsAndMessaging::{
-        EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, GetMessageW, WINEVENT_OUTOFCONTEXT,
+        EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_SYSTEM_FOREGROUND,
+        EVENT_SYSTEM_MINIMIZEEND, GetMessageW, WINEVENT_OUTOFCONTEXT,
         WINEVENT_SKIPOWNPROCESS,
     },
 };
 
-use crate::app::subscription::global::GlobalMessage;
+use crate::{
+    app::subscription::global::GlobalMessage,
+    scroll_tiler::IS_APPLYING_LAYOUT,
+};
 
-const WINDOW_HOOK_COOLDOWN: Duration = Duration::from_millis(200);
+const WINDOW_HOOK_COOLDOWN: Duration = Duration::from_millis(150);
 
 struct WindowHookManager {
     tx: Sender<GlobalMessage>,
@@ -37,13 +44,15 @@ impl WindowHookManager {
     }
 
     fn tick(&mut self) {
+        if IS_APPLYING_LAYOUT.load(Ordering::SeqCst) {
+            return;
+        }
         let elapsed = self.last_time_notified.elapsed();
         if elapsed > WINDOW_HOOK_COOLDOWN {
-            self.tx.try_send(GlobalMessage::Window).unwrap();
+            let _ = self.tx.try_send(GlobalMessage::Window);
             self.last_time_notified = Instant::now();
         } else {
             let original_last_time_notified = self.last_time_notified;
-            // TODO: Needs serious rework to avoid spawning threads like this. Use async timers instead.
             thread::Builder::new()
                 .name("window-hook-cooldown-timer".to_string())
                 .spawn(move || {
@@ -52,10 +61,12 @@ impl WindowHookManager {
                         reason = "Underflow is prevented by condition above"
                     )]
                     thread::sleep(WINDOW_HOOK_COOLDOWN - elapsed);
-                    if let Some(context) = WINDOW_HOOK_MANAGER.lock().unwrap().as_mut()
-                        && context.last_time_notified == original_last_time_notified
-                    {
-                        context.tick();
+                    if !IS_APPLYING_LAYOUT.load(Ordering::SeqCst) {
+                        if let Some(context) = WINDOW_HOOK_MANAGER.lock().unwrap().as_mut()
+                            && context.last_time_notified == original_last_time_notified
+                        {
+                            context.tick();
+                        }
                     }
                 })
                 .unwrap();
@@ -74,7 +85,9 @@ unsafe extern "system" fn win_event_hook_callback(
     _ideventthread: u32,
     _dwmseventtime: u32,
 ) {
-    // TODO: try async here with a block on
+    if IS_APPLYING_LAYOUT.load(Ordering::SeqCst) {
+        return;
+    }
     if let Some(manager) = WINDOW_HOOK_MANAGER.lock().unwrap().as_mut() {
         manager.tick();
     }
@@ -92,7 +105,16 @@ pub fn launch(tx: Sender<GlobalMessage>) {
     if let Err(e) = thread::Builder::new()
         .name("win-event-hook-loop".to_string())
         .spawn(move || unsafe {
-            let hook = SetWinEventHook(
+            let hook1 = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_SYSTEM_MINIMIZEEND,
+                None,
+                Some(win_event_hook_callback),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+            let hook2 = SetWinEventHook(
                 EVENT_OBJECT_CREATE,
                 EVENT_OBJECT_LOCATIONCHANGE,
                 None,
@@ -102,7 +124,8 @@ pub fn launch(tx: Sender<GlobalMessage>) {
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             );
             if !GetMessageW(null_mut(), None, 0, 0).as_bool() {
-                let _ = UnhookWinEvent(hook);
+                let _ = UnhookWinEvent(hook1);
+                let _ = UnhookWinEvent(hook2);
                 WINDOW_HOOK_MANAGER.lock().unwrap().take();
             }
         })

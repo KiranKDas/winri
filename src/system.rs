@@ -77,6 +77,7 @@ pub fn restore_windows() {
 
     let mut pos = Position([100.0, 100.0]);
     for window in windows {
+        let _ = window.set_opacity(1.0);
         if let Err(err) = window.move_to(pos, [800.0, 600.0].into()) {
             warn!("Failed to move window {window:?}: {err}");
         }
@@ -147,5 +148,54 @@ pub fn aquire_winri_running_lock() -> anyhow::Result<Option<HANDLE>> {
         Ok(None)
     } else {
         Ok(Some(mutex))
+    }
+}
+
+/// Find all Windows taskbar handles (primary and secondary).
+pub fn taskbar_windows() -> Vec<windows::Win32::Foundation::HWND> {
+    let mut bars = Vec::new();
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+        for class in [
+            windows_strings::w!("Shell_TrayWnd"),
+            windows_strings::w!("Shell_SecondaryTrayWnd"),
+        ] {
+            if let Ok(hwnd) = FindWindowW(class, windows_strings::PCWSTR::null()) {
+                if !hwnd.is_invalid() {
+                    bars.push(hwnd);
+                }
+            }
+        }
+    }
+    bars
+}
+
+/// Ensure that the Windows taskbars (primary and secondary) stay at the top
+/// of the Z-order so application windows remain behind them always.
+pub fn ensure_taskbar_on_top() {
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, HWND_TOP, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        };
+        for taskbar in taskbar_windows() {
+            let _ = SetWindowPos(
+                taskbar,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                taskbar,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
     }
 }

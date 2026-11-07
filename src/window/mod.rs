@@ -21,10 +21,12 @@ use windows::{
         UI::WindowsAndMessaging::{
             EnumWindows, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
             GetClientRect, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-            GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, MoveWindow,
-            PostMessageW, SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
-            SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_LONG_PTR_INDEX, WINDOW_STYLE,
-            WM_CLOSE, WS_DLGFRAME, WS_EX_NOACTIVATE, WS_POPUP,
+            GetWindowThreadProcessId, HWND_TOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
+            LWA_ALPHA, MoveWindow, PostMessageW, SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE,
+            SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+            WINDOW_LONG_PTR_INDEX, WINDOW_STYLE, WINDOW_EX_STYLE, WM_CLOSE, WS_DLGFRAME, WS_EX_APPWINDOW,
+            WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZE, WS_MAXIMIZEBOX, WS_POPUP,
+            WS_THICKFRAME,
         },
     },
     core::BOOL,
@@ -162,18 +164,31 @@ impl Window {
         #[allow(clippy::cast_sign_loss, reason = "WINDOW_STYLE is u32")]
         let style = WINDOW_STYLE(style as u32);
 
+        // Resizable or maximizable windows are application windows, not dialogs.
+        if style.contains(WS_MAXIMIZEBOX) || style.contains(WS_THICKFRAME) {
+            return Ok(false);
+        }
+
         Ok(style.contains(WS_POPUP) && style.contains(WS_DLGFRAME))
+    }
+
+    /// Whether the window is a tool window (`WS_EX_TOOLWINDOW` without `WS_EX_APPWINDOW`).
+    /// Tool windows (floating palettes, OSD overlays, toolbars) are excluded from tiling.
+    pub fn is_tool_window(self) -> anyhow::Result<bool> {
+        ensure_valid!(self);
+        let ex_style = self.get_window_long(GWL_EXSTYLE)?;
+
+        #[allow(clippy::cast_sign_loss, reason = "WINDOW_EX_STYLE is u32")]
+        let ex_style = WINDOW_EX_STYLE(ex_style as u32);
+
+        Ok(ex_style.contains(WS_EX_TOOLWINDOW) && !ex_style.contains(WS_EX_APPWINDOW))
     }
 
     pub fn title(self) -> anyhow::Result<Option<String>> {
         ensure_valid!(self);
 
         let title_len = wincall_into_result!(GetWindowTextLengthW(self.handle()))?;
-        ensure!(
-            title_len >= 0,
-            "Unexpected error, window title length is negative: {title_len}"
-        );
-        if title_len == 0 {
+        if title_len <= 0 {
             return Ok(None);
         }
 
@@ -183,11 +198,9 @@ impl Window {
         let mut title = vec![0u16; title_len + 1];
 
         let title_len_read = wincall_into_result!(GetWindowTextW(self.handle(), &mut title))?;
-        ensure!(
-            title_len_read != 0,
-            "Expected reading title of length {} but read 0",
-            title.len()
-        );
+        if title_len_read == 0 {
+            return Ok(None);
+        }
 
         let title = unsafe { windows_strings::PCWSTR::from_raw(title.as_ptr()).to_string() }?;
 
@@ -211,24 +224,70 @@ impl Window {
     pub fn process_name(self) -> anyhow::Result<String> {
         ensure_valid!(self);
         let process_id = self.process_id()?;
-        let process = wincall_result!(OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-            false,
-            process_id,
-        ))?;
+
+        // Try PROCESS_QUERY_LIMITED_INFORMATION first so elevated processes (e.g. Windhawk,
+        // Task Manager) can be queried without ERROR_ACCESS_DENIED.
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        let process_res = unsafe {
+            OpenProcess(
+                windows::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_LIMITED_INFORMATION),
+                false,
+                process_id,
+            )
+        };
+        let process = match process_res {
+            Ok(p) => p,
+            Err(_) => {
+                let fallback = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                        false,
+                        process_id,
+                    )
+                };
+                match fallback {
+                    Ok(p) => p,
+                    Err(_) => return Ok(String::new()),
+                }
+            }
+        };
+
+        unsafe extern "system" {
+            fn QueryFullProcessImageNameW(
+                h_process: windows::Win32::Foundation::HANDLE,
+                dw_flags: u32,
+                lp_exe_name: *mut u16,
+                lpdw_size: *mut u32,
+            ) -> windows::core::BOOL;
+        }
+
+        let mut buffer = vec![0u16; 1024];
+        let mut len = buffer.len() as u32;
+        let success = unsafe { QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &raw mut len) };
+        if success.as_bool() && len > 0 {
+            if let Ok(process_file_path) = unsafe { windows_strings::PCWSTR::from_raw(buffer.as_ptr()).to_string() } {
+                let name = process_file_path
+                    .split('\\')
+                    .next_back()
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(name);
+            }
+        }
 
         let mut process_name = vec![0u16; 256];
+        if let Ok(_) = wincall_into_result!(GetModuleFileNameExW(Some(process), None, &mut process_name)) {
+            if let Ok(process_file_path) = unsafe { windows_strings::PCWSTR::from_raw(process_name.as_ptr()).to_string() } {
+                let name = process_file_path
+                    .split('\\')
+                    .next_back()
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(name);
+            }
+        }
 
-        let _ = wincall_into_result!(GetModuleFileNameExW(Some(process), None, &mut process_name))?;
-
-        let process_file_path =
-            unsafe { windows_strings::PCWSTR::from_raw(process_name.as_ptr()).to_string() }?;
-        let process_name = process_file_path
-            .split('\\')
-            .next_back()
-            .unwrap()
-            .to_string();
-        Ok(process_name)
+        Ok(String::new())
     }
 
     /// The window class name. Used by the filter to ignore system windows.
@@ -352,6 +411,83 @@ impl Window {
         Ok(())
     }
 
+    /// Whether the window is currently maximized (`WS_MAXIMIZE` / `IsZoomed`).
+    #[allow(dead_code)]
+    pub fn is_maximized(self) -> anyhow::Result<bool> {
+        ensure_valid!(self);
+        Ok(wincall_into_result!(IsZoomed(self.handle()))?.as_bool())
+    }
+
+    /// Restore the window if it is currently minimized (iconic) or maximized (zoomed).
+    /// This is essential before `DeferWindowPos`, because Win32 locks maximized
+    /// windows to full screen coordinates, preventing tiling/scrolling.
+    pub fn restore_if_maximized_or_minimized(self) -> anyhow::Result<bool> {
+        ensure_valid!(self);
+        let is_min = wincall_into_result!(IsIconic(self.handle()))?.as_bool();
+        let is_max = wincall_into_result!(IsZoomed(self.handle()))?.as_bool();
+        if is_max {
+            // Strip WS_MAXIMIZE style so Win32 permits moving/scrolling via DeferWindowPos
+            let style = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(self.handle(), GWL_STYLE) };
+            if (style & (WS_MAXIMIZE.0 as isize)) != 0 {
+                unsafe {
+                    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                        self.handle(),
+                        GWL_STYLE,
+                        style & !(WS_MAXIMIZE.0 as isize),
+                    );
+                }
+            }
+            let _ = wincall_into_result!(ShowWindow(self.handle(), SW_RESTORE))?;
+            return Ok(true);
+        }
+        if is_min {
+            let _ = wincall_into_result!(ShowWindow(self.handle(), SW_RESTORE))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Sets window opacity (0.0 = fully transparent, 1.0 = fully opaque).
+    pub fn set_opacity(self, opacity: f32) -> anyhow::Result<()> {
+        ensure_valid!(self);
+        let alpha = (opacity.clamp(0.1, 1.0) * 255.0) as u8;
+        unsafe {
+            let ex_style = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(self.handle(), GWL_EXSTYLE);
+            if alpha == 255 {
+                if (ex_style & (WS_EX_LAYERED.0 as isize)) != 0 {
+                    let _ = SetLayeredWindowAttributes(
+                        self.handle(),
+                        windows::Win32::Foundation::COLORREF(0),
+                        255,
+                        LWA_ALPHA,
+                    );
+                }
+            } else {
+                if (ex_style & (WS_EX_LAYERED.0 as isize)) == 0 {
+                    let _ = SetWindowLongPtrW(
+                        self.handle(),
+                        GWL_EXSTYLE,
+                        ex_style | (WS_EX_LAYERED.0 as isize),
+                    );
+                }
+                let _ = SetLayeredWindowAttributes(
+                    self.handle(),
+                    windows::Win32::Foundation::COLORREF(0),
+                    alpha,
+                    LWA_ALPHA,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the window if it is currently minimised (iconic).
+    #[allow(dead_code)]
+    pub fn restore_if_minimized(self) -> anyhow::Result<()> {
+        self.restore_if_maximized_or_minimized()?;
+        Ok(())
+    }
+
     /// Raises the window to the top of the z-order without moving or resizing.
     pub fn set_max_zindex(self) -> anyhow::Result<()> {
         ensure_valid!(self);
@@ -412,7 +548,18 @@ impl Window {
 
     pub fn is_focused(self) -> anyhow::Result<bool> {
         ensure_valid!(self);
-        Ok(Self::focused()? == self)
+        let Ok(focused) = Self::focused() else {
+            return Ok(false);
+        };
+        if focused == self {
+            return Ok(true);
+        }
+        if let Ok(ancestor) = focused.ancestor() {
+            if ancestor == self {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Brings the window to the foreground, restoring it if minimized.
@@ -436,6 +583,7 @@ impl Window {
         // https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
         rdev::simulate(&rdev::EventType::KeyRelease(rdev::Key::Alt))?;
         let _ = wincall_into_result!(SetForegroundWindow(self.handle()))?;
+        crate::system::ensure_taskbar_on_top();
         Ok(())
     }
 

@@ -4,8 +4,9 @@ use anyhow::Context;
 
 use crate::{
     app::{self, Mode},
+    system,
     utils::math::Bounds,
-    window::{Window, filter::opened_windows},
+    window::{Window, filter::opened_windows_with_rules},
 };
 
 /// State specific to tiler mode. Kept minimal: the [`ScrollTiler`] holds the
@@ -76,27 +77,45 @@ impl app::State {
     pub fn update_tiler(&mut self) -> anyhow::Result<()> {
         ensure_tiler_mode_result!(self.mode);
 
-        let windows_snapshot = opened_windows().context("Window enumeration for tiler update")?;
+        let rules = self.config.load().window_rules.clone();
+        let windows_snapshot = opened_windows_with_rules(&rules)
+            .context("Window enumeration for tiler update")?;
 
         log::info!("Opened windows: {:?}", get_process_names(&windows_snapshot));
 
         self.tiler.handle_window_snapshot(&windows_snapshot);
 
         self.update_tiler_border()?;
+        system::ensure_taskbar_on_top();
 
         Ok(())
     }
 
     /// Syncs the overlay's highlight border to the currently focused window's
-    /// frame (or clears it when nothing is focused).
+    /// frame (or clears it when nothing is focused or when animating).
+    ///
+    /// Per Niri/Winri performance requirements:
+    /// Never query DWM or draw the border while the camera/windows are translating,
+    /// and only draw once the window is verified to be fully focused by Windows OS.
     pub fn update_tiler_border(&mut self) -> anyhow::Result<()> {
         bind_tiler_mode_result!(self.mode => TilerState { current_border_bounds });
+
+        if self.tiler.is_animating() || self.tiler.is_current_column_fullscreen() {
+            *current_border_bounds = None;
+            return Ok(());
+        }
+
         if let Some(focused_window) = self.tiler.focused_window() {
-            let bounds = focused_window
-                .desktop_manager_bounds()
-                .context("Desktop manager bounds querying for tiler border update")?;
-            if current_border_bounds != &Some(bounds) {
-                *current_border_bounds = Some(bounds);
+            if focused_window.is_focused().unwrap_or(false) {
+                let bounds = focused_window
+                    .desktop_manager_bounds()
+                    .or_else(|_| focused_window.outer_bounds())
+                    .context("Bounds querying for tiler border update")?;
+                if current_border_bounds != &Some(bounds) {
+                    *current_border_bounds = Some(bounds);
+                }
+            } else {
+                *current_border_bounds = None;
             }
         } else {
             *current_border_bounds = None;
@@ -113,6 +132,7 @@ impl app::State {
             self.mode = Mode::Tiler(State::default());
             self.update_tiler()
                 .context("initial tiler update on mode switch")?;
+            system::ensure_taskbar_on_top();
         }
         Ok(())
     }

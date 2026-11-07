@@ -17,6 +17,11 @@ pub struct Bounds {
 }
 
 impl Bounds {
+    #[allow(dead_code)]
+    pub const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        Self { left, top, right, bottom }
+    }
+
     pub fn position(&self) -> Position {
         Position([self.left, self.top])
     }

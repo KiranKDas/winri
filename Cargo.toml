@@ -18,7 +18,7 @@ itertools = "0"
 keyboard-types = { version = "0.8", features = ["std", "serde"] }
 dirs = "6"
 webbrowser = "1"
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 yaml_serde = "0.10"
 csscolorparser = { version = "0.8", features = ["serde"] }
 arc-swap = "1.9"
@@ -31,6 +31,7 @@ features = [
     "Win32_UI_Accessibility",
     "Win32_System_ProcessStatus",
     "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 [dependencies.iced]
